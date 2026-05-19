@@ -4,3 +4,5 @@ discord.log
 jobs.db
 jobs.db-journal
 .venv
+__pycache__/
+*.pyc
