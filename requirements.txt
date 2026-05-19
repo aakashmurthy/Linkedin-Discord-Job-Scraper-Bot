@@ -15,9 +15,11 @@ markdownify==0.13.1
 multidict==6.1.0
 numpy==1.26.3
 pandas==2.2.3
+openai>=1.0.0
 propcache==0.2.0
 pydantic==2.9.2
 pydantic_core==2.23.4
+pypdf>=5.0.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 python-jobspy==1.1.75

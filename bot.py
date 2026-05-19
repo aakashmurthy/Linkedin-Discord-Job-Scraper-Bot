@@ -34,6 +34,83 @@ from pypdf import PdfReader
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env", override=False)
 
+# USER CUSTOMIZATION
+# Edit these values to control which jobs are searched, filtered, and pinged.
+SEARCH_SITES = ['linkedin', 'indeed', 'glassdoor']
+SEARCH_KEYWORDS = [
+    "computer science",
+    "software",
+    "devops",
+    "developer",
+]
+SEARCH_QUERY = " OR ".join(f"({keyword})" if " " in keyword else keyword for keyword in SEARCH_KEYWORDS)
+
+REQUIRED_TITLE_KEYWORDS = [
+    "engineer", "technology", "developer", "software", "new grad", "entry level", "entry",
+    "data", "sde", "it", "programmer", "machine learning", "ml", "ai", "firmware",
+    "embedded", "cloud", "devops", "analyst", "cybersecurity", "automation",
+]
+
+BLOCKED_TITLE_KEYWORDS = {
+    "senior",
+    "lead",
+    "manager",
+    "director",
+    "principal",
+    "vp",
+    "Sr.",
+    "Sr",
+    "Senior",
+    "Lead",
+    "Manager",
+    "Director",
+    "Principal",
+    "VP",
+    "sr.",
+    "Snr",
+    "II",
+    "III",
+    "president"
+}
+
+BLACKLISTED_COMPANIES = {
+    'Team Remotely Inc',
+    'HireMeFast LLC',
+    'Get It Recruit - Information Technology',
+    "Offered.ai",
+    "4 Staffing Corp",
+    "myGwork - LGBTQ+ Business Community",
+    "Patterned Learning AI",
+    "Mindpal",
+    "Phoenix Recruiting",
+    "SkyRecruitment",
+    "Phoenix Recruitment",
+    "Patterned Learning Career",
+    "SysMind",
+    "SysMind LLC",
+    "Motion Recruitment",
+    "DataAnnotation",
+    "BeaconFire Inc.",
+    "Helic & Co.",
+    "ShrinQ Consulting Group Inc",
+    "New Relic",
+    "General Dynamics Mission Systems",
+    "Jobs via Dice",
+    "Lensa",
+    "Jobright.ai",
+}
+
+# Pinger customization: jobs with matching locations get the mention prepended.
+PING_MENTION = "@everyone"
+PING_LOCATION_STATE_CODES = [
+    "OR",
+    "WA",
+]
+PING_LOCATION_NAMES = [
+    "Oregon",
+    "Washington",
+]
+
 OPENAI_BASE_URL = (
     os.getenv("OPENAI_BASE_URL")
     or os.getenv("OPENAI_API_BASE_URL")
@@ -171,64 +248,6 @@ engine = create_engine(f"sqlite:///{BASE_DIR / 'jobs.db'}", echo=False)
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
 
-blacklist_companies = {
-    'Team Remotely Inc',
-    'HireMeFast LLC',
-    'Get It Recruit - Information Technology',
-    "Offered.ai",
-    "4 Staffing Corp",
-    "myGwork - LGBTQ+ Business Community",
-    "Patterned Learning AI",
-    "Mindpal",
-    "Phoenix Recruiting",
-    "SkyRecruitment",
-    "Phoenix Recruitment",
-    "Patterned Learning Career",
-    "SysMind",
-    "SysMind LLC",
-    "Motion Recruitment",
-    "DataAnnotation",
-    "BeaconFire Inc.",
-    "Helic & Co.",
-    "ShrinQ Consulting Group Inc",
-    "New Relic",
-    "General Dynamics Mission Systems",
-    "Jobs via Dice",
-    "Lensa",
-    "Jobright.ai",
-}
-
-bad_roles = {
-    "senior",
-    "lead",
-    "manager",
-    "director",
-    "principal",
-    "vp",
-    "Sr.",
-    "Sr",
-    "Senior",
-    "Lead",
-    "Manager",
-    "Director",
-    "Principal",
-    "VP",
-    "sr.",
-    "Snr",
-    "II",
-    "III",
-    "president"
-}
-
-SEARCH_SITES = ['linkedin', 'indeed', 'glassdoor']
-SEARCH_QUERY = "(computer science) OR software OR devops OR developer"
-
-required_terms = [
-    "engineer", "technology", "developer", "software", "new grad", "entry level", "entry",
-    "data", "sde", "it", "programmer", "machine learning", "ml", "ai", "firmware",
-    "embedded", "cloud", "devops", "analyst", "cybersecurity", "automation",
-]
-
 class JobScraperApp:
     def __init__(self, apobj: apprise.Apprise) -> None:
         self.logger = logger
@@ -343,15 +362,15 @@ class JobScraperApp:
         session = SessionLocal()
         try:
             for row in job_rows:
-                if row['company'] in blacklist_companies:
+                if row['company'] in BLACKLISTED_COMPANIES:
                     self.logger.info("Skipping blacklisted company: %s in channel: %s", row['company'], channel_name)
                     continue
 
-                if not any(term.lower() in row['title'].lower() for term in required_terms):
+                if not any(term.lower() in row['title'].lower() for term in REQUIRED_TITLE_KEYWORDS):
                     self.logger.info("Skipping title '%s' (no required terms) in channel: %s", row['title'], channel_name)
                     continue
 
-                if any(term.lower() in row['title'].lower() for term in bad_roles):
+                if any(term.lower() in row['title'].lower() for term in BLOCKED_TITLE_KEYWORDS):
                     self.logger.info("Skipping bad role title: %s in channel: %s", row['title'], channel_name)
                     continue
 
@@ -378,7 +397,7 @@ class JobScraperApp:
 
                 loc = row.get('location')
                 location_str = "" if (loc is None or (isinstance(loc, float) and pd.isna(loc))) else str(loc)
-                is_pnw = bool(re.search(r'(?:,\s*|\b)(?:WA|OR)\b', location_str))
+                should_ping = self._should_ping_for_location(location_str)
                 reason_display = "LLM check skipped." if reason.startswith("LLM check skipped") else reason
                 job_info = (
                     f">>> ## {''.join(random.choices(['🎉', '👏', '💼', '🔥', '💻'], k=1))} "
@@ -387,11 +406,32 @@ class JobScraperApp:
                     f"### **Location:**\n{location_str}\n\n"
                     f"### **Reason:**\n{reason_display}"
                 )
-                message = f"@everyone\n{job_info}" if is_pnw else job_info
+                message = f"{PING_MENTION}\n{job_info}" if should_ping else job_info
                 self.logger.info("Posting job: %s to channel: %s (tag: ft)%s", row['title'], channel_name, log_suffix)
                 await self._notify_then_persist(session, job_model, row, message, "ft", application_url, company_url)
         finally:
             session.close()
+
+    def _should_ping_for_location(self, location: str) -> bool:
+        if not PING_MENTION:
+            return False
+
+        state_code_match = False
+        if PING_LOCATION_STATE_CODES:
+            escaped_codes = "|".join(re.escape(code) for code in PING_LOCATION_STATE_CODES)
+            state_code_match = bool(re.search(rf"(?:,\s*|\b)(?:{escaped_codes})\b", location))
+
+        state_name_match = False
+        if PING_LOCATION_NAMES:
+            name_patterns = []
+            for name in PING_LOCATION_NAMES:
+                escaped_name = re.escape(name)
+                if name.lower() == "washington":
+                    escaped_name = rf"{escaped_name}\b(?!\s*(?:,|\s)\s*D\.?C\.?\b)"
+                name_patterns.append(escaped_name)
+            state_name_match = bool(re.search(rf"\b(?:{'|'.join(name_patterns)})\b", location, flags=re.IGNORECASE))
+
+        return state_code_match or state_name_match
 
     async def full_time_job_task(self) -> None:
         if not self.full_time_configured:

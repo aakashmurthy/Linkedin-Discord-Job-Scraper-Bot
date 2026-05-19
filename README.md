@@ -4,6 +4,13 @@ This project continuously scrapes recent software-related job listings, filters 
 
 Despite the repository name, the current implementation does not log in as a Discord bot. Discord delivery is handled through Apprise, typically with a Discord webhook URL.
 
+## Requirements
+
+- Python 3.11
+- A text-based `Resume.pdf` in the project root
+- An OpenAI-compatible API key in your environment
+- At least one Apprise notification target if you want full-time job alerts
+
 ## What It Does
 
 - Scrapes recent jobs from LinkedIn, Indeed, and Glassdoor with `python-jobspy`
@@ -17,26 +24,6 @@ Despite the repository name, the current implementation does not log in as a Dis
 - Stores seen jobs in `jobs.db` so they are not posted repeatedly
 - Repeats the scrape loop every 60 seconds
 
-## Current Architecture
-
-The project is currently a single-process Python app centered around [`bot.py`](/root/server-programs/Linkedin-Discord-Job-Scraper-Bot/bot.py).
-
-Core components:
-
-- Job scraping: `jobspy.scrape_jobs(...)`
-- Resume parsing: `pypdf.PdfReader`
-- LLM filtering: `openai.AsyncOpenAI().responses.parse(...)`
-- Notifications: `apprise.Apprise`
-- Persistence: SQLite via SQLAlchemy in `jobs.db`
-- Logging: console output plus rotating log files in `discord.log`
-
-## Requirements
-
-- Python 3.11
-- A text-based `Resume.pdf` in the project root
-- An OpenAI-compatible API key in your environment
-- At least one Apprise notification target if you want full-time job alerts
-
 ## Installation
 
 ```bash
@@ -45,21 +32,28 @@ cd Linkedin-Discord-Job-Scraper-Bot
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-pip install pypdf
 ```
-
-`pypdf` is imported by the app but is not currently pinned in `requirements.txt`, so install it explicitly unless that file is updated.
 
 ## Configuration
 
-Create a local `.env` file in the project root.
+Copy the example config and edit it:
 
-Minimum useful configuration:
+```bash
+cp .env.example .env
+```
+
+The example file currently includes:
 
 ```dotenv
 OPENAI_API_KEY=your_api_key
-FT_APPRISE_URLS=discord://...or other apprise target...
+OPENAI_MODEL=gpt-5-nano-2025-08-07
+OPENAI_BASE_URL=
+FT_APPRISE_URLS=https://discord.com/api/webhooks/...
 ```
+
+At minimum, set `OPENAI_API_KEY`. Set `FT_APPRISE_URLS` if you want notifications enabled.
+
+If you want a low-cost OpenAI-compatible provider, NVIDIA NIM is a reasonable option to try because it offers a free tier. In that case, keep `OPENAI_API_KEY` set to your NVIDIA key and point `OPENAI_BASE_URL` at the NIM-compatible endpoint you want to use.
 
 Supported environment variables used by the current code:
 
@@ -70,11 +64,25 @@ Supported environment variables used by the current code:
 - `API_URL`: another fallback base URL variable name
 - `FT_APPRISE_URLS`: comma-separated Apprise URLs for full-time job notifications
 
-Variables present in the local `.env` on this machine such as `TOKEN`, `FT_CHANNEL_ID`, and `INTERN_CHANNEL_ID` are not used by the current `bot.py`.
+## Current Architecture
+
+The project is currently a single-process Python app centered around [`bot.py`](/root/Linkedin-Discord-Job-Scraper-Bot-public/bot.py).
+
+Core components:
+
+- Job scraping: `jobspy.scrape_jobs(...)`
+- Resume parsing: `pypdf.PdfReader`
+- LLM filtering: `openai.AsyncOpenAI().responses.parse(...)`
+- Notifications: `apprise.Apprise`
+- Persistence: SQLite via SQLAlchemy in `jobs.db`
+- Logging: console output plus rotating log files in `discord.log`
 
 ## Notification Setup
 
 Apprise supports many backends. For Discord, the simplest setup is usually a webhook URL.
+
+See the Apprise services catalog for the full list of supported notification backends:
+[https://appriseit.com/services/](https://appriseit.com/services/)
 
 Example:
 
@@ -127,8 +135,8 @@ nohup python3 bot.py &
 
 ## Data Files
 
-- [`bot.py`](/root/server-programs/Linkedin-Discord-Job-Scraper-Bot/bot.py): main application
-- [`requirements.txt`](/root/server-programs/Linkedin-Discord-Job-Scraper-Bot/requirements.txt): Python dependencies
+- [`bot.py`](/root/Linkedin-Discord-Job-Scraper-Bot-public/bot.py): main application
+- [`requirements.txt`](/root/Linkedin-Discord-Job-Scraper-Bot-public/requirements.txt): Python dependencies
 - `Resume.pdf`: source resume used by the filtering prompt
 - `jobs.db`: SQLite database of already-seen jobs
 - `discord.log`: rotating runtime logs
@@ -143,7 +151,7 @@ The current search configuration in code is:
 - Freshness window: last 1 hour
 - Batch size: 50 jobs per loop for the full-time task
 
-The app also highlights Pacific Northwest jobs by tagging messages with `@everyone` when the location matches `WA` or `OR`.
+The app also highlights Pacific Northwest jobs by tagging messages with `@everyone` when the location matches `WA`, `OR`, `Washington`, or `Oregon`.
 
 ## Known Gaps
 
