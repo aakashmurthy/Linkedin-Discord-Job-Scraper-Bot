@@ -9,6 +9,7 @@ Despite the repository name, the current implementation does not log in as a Dis
 - Python 3.11
 - A text-based `Resume.pdf` in the project root
 - An OpenAI-compatible API key in your environment
+  - [NVIDIA NIM](https://build.nvidia.com/explore/discover) is a free-tier option for an OpenAI-compatible provider.
 - At least one Apprise notification target if you want full-time job alerts
 
 ## What It Does
@@ -53,7 +54,7 @@ FT_APPRISE_URLS=https://discord.com/api/webhooks/...
 
 At minimum, set `OPENAI_API_KEY`. Set `FT_APPRISE_URLS` if you want notifications enabled.
 
-If you want a low-cost OpenAI-compatible provider, NVIDIA NIM is a reasonable option to try because it offers a free tier. In that case, keep `OPENAI_API_KEY` set to your NVIDIA key and point `OPENAI_BASE_URL` at the NIM-compatible endpoint you want to use.
+If you want a low-cost OpenAI-compatible provider, [NVIDIA NIM](https://build.nvidia.com/explore/discover) is a reasonable option to try because it offers a free tier. In that case, keep `OPENAI_API_KEY` set to your NVIDIA key and point `OPENAI_BASE_URL` at the NIM-compatible endpoint you want to use.
 
 Supported environment variables used by the current code:
 
