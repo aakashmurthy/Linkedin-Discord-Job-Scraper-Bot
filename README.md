@@ -1,50 +1,179 @@
-### Setup
+# LinkedIn / Discord Job Scraper Bot
 
+This project continuously scrapes recent software-related job listings, filters them against the resume in `Resume.pdf` with an OpenAI-compatible model, and sends matching jobs to one or more notification targets through [Apprise](https://github.com/caronc/apprise).
+
+Despite the repository name, the current implementation does not log in as a Discord bot. Discord delivery is handled through Apprise, typically with a Discord webhook URL.
+
+## What It Does
+
+- Scrapes recent jobs from LinkedIn, Indeed, and Glassdoor with `python-jobspy`
+- Searches for software, IT, data, ML, cloud, firmware, automation, and related roles
+- Rejects obvious mismatches before the LLM step:
+  - blacklisted companies
+  - senior/lead/manager-level titles
+  - titles that do not contain required keywords
+- Reads `Resume.pdf` and asks an OpenAI-compatible model whether a job is worth applying to
+- Sends accepted jobs through Apprise using the `ft` notification tag
+- Stores seen jobs in `jobs.db` so they are not posted repeatedly
+- Repeats the scrape loop every 60 seconds
+
+## Current Architecture
+
+The project is currently a single-process Python app centered around [`bot.py`](/root/server-programs/Linkedin-Discord-Job-Scraper-Bot/bot.py).
+
+Core components:
+
+- Job scraping: `jobspy.scrape_jobs(...)`
+- Resume parsing: `pypdf.PdfReader`
+- LLM filtering: `openai.AsyncOpenAI().responses.parse(...)`
+- Notifications: `apprise.Apprise`
+- Persistence: SQLite via SQLAlchemy in `jobs.db`
+- Logging: console output plus rotating log files in `discord.log`
+
+## Requirements
+
+- Python 3.11
+- A text-based `Resume.pdf` in the project root
+- An OpenAI-compatible API key in your environment
+- At least one Apprise notification target if you want full-time job alerts
+
+## Installation
 
 ```bash
-git clone https://github.com/haydenthai/Linkedin-Discord-Job-Scraper-Bot.git #clone it
-```
-Use python version 3.11.6
-
-(this was intended to bet setup on a mac, setup might look different on windows)
-
-```bash
-brew install pyenv
-pyenv install 3.11.6
-pyenv shell 3.11.6 #set the current shell to version 3.11.6
-python3 -m venv venv
-source venv/bin/activate
+git clone https://github.com/haydenthai/Linkedin-Discord-Job-Scraper-Bot.git
+cd Linkedin-Discord-Job-Scraper-Bot
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+pip install pypdf
 ```
 
-### Discord setup
+`pypdf` is imported by the app but is not currently pinned in `requirements.txt`, so install it explicitly unless that file is updated.
 
-1. Create a new server in discord
-2. Go to discord developer portal and create a New Application https://discord.com/developers/applications
-3. In the `Installation` tab, check `Guild Install`, in default setting at the bottom `add the bot to the scope` and in permissions add `administrator`(it could probably be scoped down to have less permissions but since you're the owner it's fine)
-4. Copy the discord provided link into your browser and install into your server, you should see in your arrivals channel that the bot got added(if you just created the server it should be in general)
-5. Go into the `Bot` tab and click `Reset Token` copy the token and paste it to the .env
-6. In your discord server, right click the channel and at the bottom you should see a button that says `Copy Channel ID`, grab it and paste them into your .env
-   - if you don't see the option at the bottom it's likely because you need to `Enable Developer Mode` in discord.
-   - You can achieve this by click the gear icon at the bottom left(User Settings) and then click on `Advanced` and enable `Developer Mode`
+## Configuration
 
-## Run it
+Create a local `.env` file in the project root.
 
-You're ready to go, run it
+Minimum useful configuration:
+
+```dotenv
+OPENAI_API_KEY=your_api_key
+FT_APPRISE_URLS=discord://...or other apprise target...
+```
+
+Supported environment variables used by the current code:
+
+- `OPENAI_API_KEY`: credential used by the OpenAI Python SDK
+- `OPENAI_MODEL`: optional model override; defaults to `gpt-5-nano-2025-08-07`
+- `OPENAI_BASE_URL`: optional custom OpenAI-compatible API base URL
+- `OPENAI_API_BASE_URL`: alternate base URL variable name
+- `API_URL`: another fallback base URL variable name
+- `FT_APPRISE_URLS`: comma-separated Apprise URLs for full-time job notifications
+
+Variables present in the local `.env` on this machine such as `TOKEN`, `FT_CHANNEL_ID`, and `INTERN_CHANNEL_ID` are not used by the current `bot.py`.
+
+## Notification Setup
+
+Apprise supports many backends. For Discord, the simplest setup is usually a webhook URL.
+
+Example:
+
+```dotenv
+FT_APPRISE_URLS=https://discord.com/api/webhooks/...
+```
+
+You can send to multiple destinations by separating URLs with commas:
+
+```dotenv
+FT_APPRISE_URLS=https://discord.com/api/webhooks/...,ntfy://topic-name?format=markdown
+```
+
+If `FT_APPRISE_URLS` is missing, the app still runs but skips the full-time notification task.
+
+## Resume Requirements
+
+The application reads `Resume.pdf` at startup and exits immediately if:
+
+- the file is missing
+- the PDF is unreadable
+- the PDF contains no extractable text
+
+Use a normal text-based PDF, not an image-only scan.
+
+## How Matching Works
+
+The LLM prompt is intentionally strict. It tries to reject jobs when:
+
+- required years of experience are above the candidate's qualifying corporate experience
+- the role is too senior
+- required hard skills are missing
+- clearance or citizenship requirements are missing
+
+If the LLM call fails because of rate limits, auth issues, or API errors, the app fails open and treats the job as postable while logging the reason.
+
+## Running
+
+Start the bot:
 
 ```bash
-python bot.py
+python3 bot.py
 ```
 
-You can also run it as a process in the background by running
+Run it in the background:
 
+```bash
+nohup python3 bot.py &
 ```
-nohup python bot.py
-```
 
-> Nohup, short for no hang up is a command in Linux systems that keep processes running even after exiting the shell or terminal. Nohup prevents the processes or jobs from receiving the SIGHUP (Signal Hang UP) signal. This is a signal that is sent to a process upon closing or exiting the terminal.
+## Data Files
 
-### Quick Shoutout
+- [`bot.py`](/root/server-programs/Linkedin-Discord-Job-Scraper-Bot/bot.py): main application
+- [`requirements.txt`](/root/server-programs/Linkedin-Discord-Job-Scraper-Bot/requirements.txt): Python dependencies
+- `Resume.pdf`: source resume used by the filtering prompt
+- `jobs.db`: SQLite database of already-seen jobs
+- `discord.log`: rotating runtime logs
 
-This repo uses [JobSpy library](https://github.com/Bunsly/JobSpy), a Jobs scraper library for LinkedIn, Indeed, Glassdoor, Google & ZipRecruiter, made possible by [@cullenwatson](https://github.com/cullenwatson) and the talented engineers at [Bunsly](https://github.com/Bunsly) so go show some love and give them a follow
+## Search Behavior
+
+The current search configuration in code is:
+
+- Sites: `linkedin`, `indeed`, `glassdoor`
+- Search query: `(computer science) OR software OR devops OR developer`
+- Location: `United States`
+- Freshness window: last 1 hour
+- Batch size: 50 jobs per loop for the full-time task
+
+The app also highlights Pacific Northwest jobs by tagging messages with `@everyone` when the location matches `WA` or `OR`.
+
+## Known Gaps
+
+- The repository has no real automated test suite yet
+- `requirements.txt` is incomplete relative to `bot.py`
+- The implementation is a single large script with hardcoded search and filtering rules
+- Secrets should not be committed in `.env` or other tracked files
+
+## Troubleshooting
+
+`Resume.pdf not found in the project directory`
+
+- Add `Resume.pdf` to the repository root
+
+`Resume.pdf could not be read`
+
+- Export a text-based PDF instead of a scanned image PDF
+
+No jobs are being posted
+
+- Check that `FT_APPRISE_URLS` is set
+- Check `discord.log` for scrape failures or notification errors
+- Verify your OpenAI-compatible credentials are valid
+
+OpenAI request failures in logs
+
+- Confirm `OPENAI_API_KEY`
+- If using a non-OpenAI provider, set `OPENAI_BASE_URL`, `OPENAI_API_BASE_URL`, or `API_URL`
+- Reduce request frequency or change models if you are hitting rate limits
+
+## Security Note
+
+This project uses environment variables for credentials, but local `.env` files and webhook URLs should be treated as secrets. Do not commit real API keys or live webhook endpoints.

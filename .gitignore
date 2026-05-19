@@ -3,3 +3,4 @@ venv
 discord.log
 jobs.db
 jobs.db-journal
+.venv

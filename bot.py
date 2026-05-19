@@ -1,59 +1,116 @@
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
 import os
 import platform
 import random
+import re
+import asyncio
+import apprise
+import pandas as pd
+import time
 
+from pathlib import Path
 from jobspy import scrape_jobs
-import discord
-from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session as SessionType
 from sqlalchemy import Column, Integer, String
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    APIError,
+    AuthenticationError,
+    InternalServerError,
+    OpenAIError,
+    PermissionDeniedError,
+    RateLimitError,
+    AsyncOpenAI,
+)
+from pydantic import BaseModel
+from pypdf import PdfReader
 
-intents = discord.Intents.default()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=BASE_DIR / ".env", override=False)
 
+OPENAI_BASE_URL = (
+    os.getenv("OPENAI_BASE_URL")
+    or os.getenv("OPENAI_API_BASE_URL")
+    or os.getenv("API_URL")
+)
+gpt = AsyncOpenAI(base_url=OPENAI_BASE_URL) if OPENAI_BASE_URL else AsyncOpenAI()
+apobj = apprise.Apprise()
 Base = declarative_base()
+
+def _load_apprise_urls(apobj: apprise.Apprise, env_var: str, tag: str) -> None:
+    raw = os.getenv(env_var, "")
+    for url in raw.split(","):
+        url = url.strip()
+        if url:
+            apobj.add(url, tag=tag)
+
+_load_apprise_urls(apobj, "FT_APPRISE_URLS", "ft")
+
+# Read Resume.pdf — exits with a clear message if missing or unreadable
+try:
+    _reader = PdfReader(str(BASE_DIR / "Resume.pdf"))
+    RESUME = _reader.pages[0].extract_text() or ""
+    del _reader
+except FileNotFoundError:
+    print("ERROR: Resume.pdf not found in the project directory. Please add it before running.", file=sys.stderr)
+    sys.exit(1)
+if not RESUME:
+    print("ERROR: Resume.pdf could not be read (possibly an image-only PDF). Please use a text-based PDF.", file=sys.stderr)
+    sys.exit(1)
+
+CACHE_ID = str(time.time())
+
+SYSTEM_PROMPT = f"""You are a Strict Application Auditor. Your task is to filter a specific candidate's resume against various job descriptions.
+
+# PRIMARY DIRECTIVE: QUANTITATIVE AUDIT
+You must evaluate the candidate based on the following strict rules. If any rule is violated, `apply` must be false.
+
+1.  **YEARS OF EXPERIENCE (STRICT CALCULATION):**
+    -   **FILTER STEP (CRITICAL):** You must IGNORE and EXCLUDE any experience entries labeled as:
+        * "Independent" / "Independent Seller"
+        * "Sole Proprietor" / "Self-Employed" / "Freelance"
+        * "Founder" (unless for a Venture Backed startup)
+    -   **CALCULATION:** Sum the years of *only* the remaining corporate/W2 employment roles.
+    -   **COMPARE:** If (Valid Corporate Years) < (Required Years - 1), REJECT.
+    -   *Reason format: "Mismatch: JD requires 5 years, Resume has [X] valid corporate years (excluded Independent role)."*
+
+2.  **SENIORITY MISMATCH:**
+    -   Reject if JD asks for Senior/Lead/Principal and Resume is Entry/Junior/Intern.
+    -   *Reason format: "Mismatch: Seniority level (Junior vs Lead)."*
+
+3.  **MANDATORY SKILLS:**
+    -   Reject if a "Must Have" or "Required" hard skill is completely absent.
+    -   *Reason format: "Missing core skill: Kubernetes."*
+
+4.  **CLEARANCE/LEGAL:**
+    -   Reject if JD requires Security Clearance or Citizenship and Resume does not specify it.
+    -   *Reason format: "Missing mandatory Security Clearance."*
+
+# OUTPUT FORMAT
+You must return a single JSON object. Do not add markdown formatting.
+{{
+  "apply": boolean,
+  "reason": string
+}}
+
+### CANDIDATE RESUME:
+\"\"\"
+{RESUME}
+\"\"\"
+"""
+
+class ApplicationAnalyzer(BaseModel):
+    apply: bool
+    reason: str
 
 class FullTimeJob(Base):
     __tablename__ = "full_time_jobs"
-
-    id = Column(Integer, primary_key=True)
-    description = Column(String)
-    job_id = Column(String, unique=True)
-    application_url = Column(String)
-    job_title = Column(String)
-    company_name = Column(String)
-    company_url = Column(String)
-    location = Column(String)
-
-class InternJob(Base):
-    __tablename__ = "intern_jobs"
-
-    id = Column(Integer, primary_key=True)
-    description = Column(String)
-    job_id = Column(String, unique=True)
-    application_url = Column(String)
-    job_title = Column(String)
-    company_name = Column(String)
-    company_url = Column(String)
-    location = Column(String)
-
-class NG2025Job(Base):
-    __tablename__ = "ng_2025_jobs"
-
-    id = Column(Integer, primary_key=True)
-    description = Column(String)
-    job_id = Column(String, unique=True)
-    application_url = Column(String)
-    job_title = Column(String)
-    company_name = Column(String)
-    company_url = Column(String)
-    location = Column(String)
-
-class NG2024Job(Base):
-    __tablename__ = "ng_2024_jobs"
 
     id = Column(Integer, primary_key=True)
     description = Column(String)
@@ -82,22 +139,26 @@ class LoggingFormatter(logging.Formatter):
         logging.CRITICAL: red + bold,
     }
 
+    _formatter_cache: dict = {}
+
     def format(self, record):
-        log_color = self.COLORS[record.levelno]
-        format = "(black){asctime}(reset) (levelcolor){levelname:<8}(reset) (green){name}(reset) {message}"
-        format = format.replace("(black)", self.black + self.bold)
-        format = format.replace("(reset)", self.reset)
-        format = format.replace("(levelcolor)", log_color)
-        format = format.replace("(green)", self.green + self.bold)
-        formatter = logging.Formatter(format, "%Y-%m-%d %H:%M:%S", style="{")
-        return formatter.format(record)
+        levelno = record.levelno
+        if levelno not in self._formatter_cache:
+            log_color = self.COLORS.get(levelno, self.reset)
+            fmt = "(black){asctime}(reset) (levelcolor){levelname:<8}(reset) (green){name}(reset) {message}"
+            fmt = fmt.replace("(black)", self.black + self.bold)
+            fmt = fmt.replace("(reset)", self.reset)
+            fmt = fmt.replace("(levelcolor)", log_color)
+            fmt = fmt.replace("(green)", self.green + self.bold)
+            self._formatter_cache[levelno] = logging.Formatter(fmt, "%Y-%m-%d %H:%M:%S", style="{")
+        return self._formatter_cache[levelno].format(record)
 
 logger = logging.getLogger("discord_bot")
 logger.setLevel(logging.INFO)
 
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(LoggingFormatter())
-file_handler = logging.FileHandler(filename="discord.log", encoding="utf-8", mode="w")
+file_handler = RotatingFileHandler(filename=str(BASE_DIR / "discord.log"), encoding="utf-8", maxBytes=10*1024*1024, backupCount=3)
 file_handler_formatter = logging.Formatter(
     "[{asctime}] [{levelname:<8}] {name}: {message}", "%Y-%m-%d %H:%M:%S", style="{"
 )
@@ -106,10 +167,9 @@ file_handler.setFormatter(file_handler_formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-engine = create_engine("sqlite:///jobs.db", echo=False)
+engine = create_engine(f"sqlite:///{BASE_DIR / 'jobs.db'}", echo=False)
 Base.metadata.create_all(engine)
-Session = sessionmaker(bind=engine)
-session = Session()
+SessionLocal = sessionmaker(bind=engine)
 
 blacklist_companies = {
     'Team Remotely Inc',
@@ -126,11 +186,19 @@ blacklist_companies = {
     "Patterned Learning Career",
     "SysMind",
     "SysMind LLC",
-    "Motion Recruitment"
+    "Motion Recruitment",
+    "DataAnnotation",
+    "BeaconFire Inc.",
+    "Helic & Co.",
+    "ShrinQ Consulting Group Inc",
+    "New Relic",
+    "General Dynamics Mission Systems",
+    "Jobs via Dice",
+    "Lensa",
+    "Jobright.ai",
 }
 
 bad_roles = {
-    "unpaid",
     "senior",
     "lead",
     "manager",
@@ -148,198 +216,251 @@ bad_roles = {
     "sr.",
     "Snr",
     "II",
-    "III"
+    "III",
+    "president"
 }
 
-quarantined_2025_terms = {
-    '2024',
-    'intern',
-    'internship'
-}
+SEARCH_SITES = ['linkedin', 'indeed', 'glassdoor']
+SEARCH_QUERY = "(computer science) OR software OR devops OR developer"
 
-quarantined_2024_terms = {
-    '2025',
-    'intern',
-    'internship'
-}
+required_terms = [
+    "engineer", "technology", "developer", "software", "new grad", "entry level", "entry",
+    "data", "sde", "it", "programmer", "machine learning", "ml", "ai", "firmware",
+    "embedded", "cloud", "devops", "analyst", "cybersecurity", "automation",
+]
 
-class DiscordBot(commands.Bot):
-    def __init__(self, s=None) -> None:
-        super().__init__(
-            command_prefix=None,
-            intents=intents,
-            help_command=None,
-        )
+class JobScraperApp:
+    def __init__(self, apobj: apprise.Apprise) -> None:
         self.logger = logger
-        self.session = s
+        self.apobj = apobj
 
-        self.ng_2024_search_terms = [
-            "new grad software engineer",
-            "recent graduate software engineer",
-            "junior software engineer"
-        ]
-        self.ng_2024_search_index = 0
+        self.full_time_configured = bool(os.getenv("FT_APPRISE_URLS", "").strip())
+        if not self.full_time_configured:
+            self.logger.warning("No Apprise URLs configured for full-time jobs; skipping related task.")
 
-        self.ng_2025_search_terms = [
-            "2025 software engineer",
-            "new grad 2025 software engineer",
-            "software engineer recent graduate 2025",
-            "2025 Data Scientist",
-            "2025 Data Analyst",
-            "2025 Data Engineer"
-        ]
-        self.ng_2025_search_index = 0
+    async def _call_llm(self, user_content: str, job_title: str, company: str) -> tuple[bool, str, str]:
+        """Call the OpenAI-compatible LLM. Returns (post, reason, log_suffix). Fails open on any error."""
+        post = True
+        reason = "LLM response unavailable."
+        log_suffix = ""
+        try:
+            openai_query = await gpt.responses.parse(
+                model=os.getenv("OPENAI_MODEL", "gpt-5-nano-2025-08-07"),
+                reasoning={"effort": "low"},
+                input=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                text_format=ApplicationAnalyzer,
+                prompt_cache_key=CACHE_ID,
+            )
+            if openai_query.output_parsed is not None:
+                post = openai_query.output_parsed.apply
+                reason = openai_query.output_parsed.reason
+            if openai_query.usage is not None:
+                self.logger.info("OpenAI usage: %s", openai_query.usage)
+                cached_details = openai_query.usage.input_tokens_details
+                cached = (cached_details.cached_tokens if cached_details is not None else 0) or 0
+                log_suffix = f". Used {openai_query.usage.input_tokens - cached}, cached {cached}"
+        except RateLimitError as e:
+            self.logger.warning("OpenAI rate limit; skipping check for %s @ %s", job_title, company, exc_info=True)
+            reason = f"LLM check skipped (rate limit). Error: {e}"
+        except (PermissionDeniedError, AuthenticationError) as e:
+            self.logger.error("OpenAI auth/permission error; skipping check for %s @ %s", job_title, company, exc_info=True)
+            reason = f"LLM check skipped (auth/permission error). Error: {e}"
+        except (APITimeoutError, APIConnectionError, InternalServerError, APIError) as e:
+            self.logger.warning("OpenAI API error; skipping check for %s @ %s", job_title, company, exc_info=True)
+            reason = f"LLM check skipped (API error). Error: {e}"
+        except OpenAIError as e:
+            self.logger.warning("OpenAI error; skipping check for %s @ %s", job_title, company, exc_info=True)
+            reason = f"LLM check skipped (OpenAI error). Error: {e}"
+        except Exception as e:
+            self.logger.exception("Unexpected error calling LLM for %s @ %s", job_title, company)
+            reason = f"LLM check skipped (unexpected error). Error: {e}"
+        return post, reason, log_suffix
 
-    @tasks.loop(minutes=1.0)
-    async def status_task(self) -> None:
-        await self.change_presence(activity=discord.Game('with jobs! 🎉'))
+    def _persist_job(
+        self,
+        session: SessionType,
+        job_model: type,
+        row: dict,
+        application_url: str,
+        company_url: str,
+    ) -> None:
+        try:
+            session.add(job_model(
+                job_id=row['id'],
+                application_url=application_url,
+                job_title=row['title'],
+                company_name=row['company'],
+                company_url=company_url,
+            ))
+            session.commit()
+        except Exception:
+            self.logger.exception("DB commit failed for job_id=%s; rolling back", row['id'])
+            session.rollback()
 
-    @status_task.before_loop
-    async def before_status_task(self) -> None:
-        await self.wait_until_ready()
+    async def _notify_then_persist(
+        self,
+        session: SessionType,
+        job_model: type,
+        row: dict,
+        message: str,
+        tag: str,
+        application_url: str,
+        company_url: str,
+    ) -> None:
+        """Notify the user first; only persist to DB if notification succeeded."""
+        try:
+            notified = await asyncio.to_thread(self.apobj.notify, body=message, tag=tag)
+        except Exception:
+            self.logger.exception(
+                "Apprise notification failed for %s @ %s; job will be retried next run",
+                row['title'], row['company'],
+            )
+            return
+        if not notified:
+            self.logger.warning(
+                "Apprise notify returned False for %s @ %s; job will be retried next run",
+                row['title'], row['company'],
+            )
+            return
+        self._persist_job(session, job_model, row, application_url, company_url)
 
-    async def setup_hook(self) -> None:
-        self.logger.info(f"Logged in as {self.user.name}")
-        self.logger.info(f"discord.py API version: {discord.__version__}")
-        self.logger.info(f"Python version: {platform.python_version()}")
-        self.logger.info(
-            f"Running on: {platform.system()} {platform.release()} ({os.name})"
-        )
-        self.logger.info("-------------------")
-        self.status_task.start()
+    async def post_jobs(self, jobs: pd.DataFrame) -> None:
+        job_model = FullTimeJob
+        channel_name = "Full-Time Jobs"
+        needed_cols = ['company', 'title', 'job_url', 'company_url', 'id', 'description', 'location']
+        available_cols = [c for c in needed_cols if c in jobs.columns]
+        required_cols = {'company', 'title', 'job_url', 'company_url', 'id'}
+        if not required_cols.issubset(set(available_cols)):
+            missing = required_cols - set(available_cols)
+            self.logger.warning("Scrape result missing required columns %s for full-time jobs; skipping", missing)
+            return
+        job_rows = jobs[available_cols].to_dict('records')
+        del jobs
 
-    async def post_jobs(self, jobs, channel_id: int):
-        target_channel = self.get_channel(channel_id)
-        if target_channel is None:
-            self.logger.error(f"No channel with ID {channel_id} found.")
-        else:
-            if channel_id == int(os.getenv('FT_CHANNEL_ID')):
-                JobModel = FullTimeJob
-                quarantine_terms = set()
-                channel_name = "Full-Time Jobs"
-                required_terms = ["engineer", "technology", "developer", "software", "new grad", "entry level", "entry"]
-            elif channel_id == int(os.getenv('INTERN_CHANNEL_ID')):
-                JobModel = InternJob
-                quarantine_terms = set()
-                channel_name = "Intern Jobs"
-                required_terms = ["intern"]
-            elif channel_id == int(os.getenv('NG_2025_CHANNEL_ID')):
-                JobModel = NG2025Job
-                quarantine_terms = quarantined_2025_terms
-                channel_name = "NG 2025 Jobs"
-                required_terms = ["engineer", "technology", "developer", "software", "new grad", "entry level", "entry"]
-            elif channel_id == int(os.getenv('NG_2024_CHANNEL_ID')):
-                JobModel = NG2024Job
-                quarantine_terms = quarantined_2024_terms
-                channel_name = "NG 2024 Jobs"
-                required_terms = ["engineer", "technology", "developer", "software", "new grad", "entry level", "entry"]
-            else:
-                self.logger.error(f"Unknown channel ID: {channel_id}")
-                return
-
-            for index, row in jobs.iterrows():
+        session = SessionLocal()
+        try:
+            for row in job_rows:
                 if row['company'] in blacklist_companies:
-                    self.logger.info(
-                        f"Skipping job from blacklisted company: {row['company']} in channel: {channel_name} (ID: {channel_id})")
+                    self.logger.info("Skipping blacklisted company: %s in channel: %s", row['company'], channel_name)
                     continue
 
                 if not any(term.lower() in row['title'].lower() for term in required_terms):
-                    self.logger.info(
-                        f"Skipping job with title '{row['title']}' as it does not contain any of the required terms {required_terms} in channel: {channel_name} (ID: {channel_id})")
-                    continue
-
-                if any(term.lower() in row['title'].lower() for term in quarantine_terms):
-                    self.logger.info(
-                        f"Skipping job with quarantined term in title: {row['title']} in channel: {channel_name} (ID: {channel_id})")
+                    self.logger.info("Skipping title '%s' (no required terms) in channel: %s", row['title'], channel_name)
                     continue
 
                 if any(term.lower() in row['title'].lower() for term in bad_roles):
-                    self.logger.info(
-                        f"Skipping job with bad role in title: {row['title']} in channel: {channel_name} (ID: {channel_id})")
+                    self.logger.info("Skipping bad role title: %s in channel: %s", row['title'], channel_name)
                     continue
 
-                query = self.session.query(JobModel).filter(JobModel.job_id == row['id']).first()
-                if query is None:
-                    job_info = f""">>> ## {''.join(random.choices(['🎉', '👏', '💼', '🔥', '💻'], k=1))} [{row['company']}](<{row['company_url']}>) just posted a new job! 
+                application_url = row['job_url']
+                company_url = row['company_url']
+                if application_url and isinstance(application_url, str) and 'linkedin.com' in application_url:
+                    application_url = re.sub(r'//[^/]*\.linkedin\.com', '//linkedin.com', application_url)
+                if company_url and isinstance(company_url, str) and 'linkedin.com' in company_url:
+                    company_url = re.sub(r'//[^/]*\.linkedin\.com', '//linkedin.com', company_url)
 
-### **Role:** 
-[**{row['title']}**](<{row['job_url']}>)
+                if session.query(job_model).filter(job_model.job_id == row['id']).first() is not None:
+                    continue
 
-### **Location:** 
-{row['location']}
----
-                    """
-                    self.logger.info(f"Posting job: {row['title']} to channel: {channel_name} (ID: {channel_id})")
-                    self.session.add(JobModel(job_id=row['id'], application_url=row['job_url'], job_title=row['title'],
-                                              company_name=row['company'], company_url=row['company_url']))
-                    await target_channel.send(job_info)
-                else:
-                    self.logger.info(
-                        f"Job already exists in the database: {row['title']} in channel: {channel_name} (ID: {channel_id})")
+                user_content = (
+                    f"### JOB DESCRIPTION for {row['title']} at {row['company']}:\n"
+                    f"\"\"\"\n{row['description']}\n\"\"\"\n\n"
+                )
+                post, reason, log_suffix = await self._call_llm(user_content, row['title'], row['company'])
 
-    @tasks.loop(seconds=0)
-    async def job_posting_task(self):
-        import asyncio
-        await self.full_time_job_task()
-        await asyncio.sleep(10)
-        await self.ng_2025_job_task()
-        await asyncio.sleep(10)
-        await self.ng_2024_job_task()
-        await asyncio.sleep(10)
-        await self.intern_job_task()
-        self.logger.info("Job posting task completed.")
+                if not post:
+                    self.logger.info("%s @ %s flagged by LLM as not compatible: %s", row['title'], row['company'], application_url)
+                    self._persist_job(session, job_model, row, application_url, company_url)
+                    continue
 
-    async def full_time_job_task(self):
-        channel_id = int(os.getenv('FT_CHANNEL_ID'))
-        full_time_jobs = await self.get_jobs(search_term="software engineer", results_wanted=20)
-        await self.post_jobs(full_time_jobs, channel_id)
+                loc = row.get('location')
+                location_str = "" if (loc is None or (isinstance(loc, float) and pd.isna(loc))) else str(loc)
+                is_pnw = bool(re.search(r'(?:,\s*|\b)(?:WA|OR)\b', location_str))
+                reason_display = "LLM check skipped." if reason.startswith("LLM check skipped") else reason
+                job_info = (
+                    f">>> ## {''.join(random.choices(['🎉', '👏', '💼', '🔥', '💻'], k=1))} "
+                    f"[{row['company']}](<{company_url}>) just posted a new job!\n\n"
+                    f"### **Role:**\n[**{row['title']}**](<{application_url}>)\n\n"
+                    f"### **Location:**\n{location_str}\n\n"
+                    f"### **Reason:**\n{reason_display}"
+                )
+                message = f"@everyone\n{job_info}" if is_pnw else job_info
+                self.logger.info("Posting job: %s to channel: %s (tag: ft)%s", row['title'], channel_name, log_suffix)
+                await self._notify_then_persist(session, job_model, row, message, "ft", application_url, company_url)
+        finally:
+            session.close()
 
-    async def intern_job_task(self):
-        channel_id = int(os.getenv('INTERN_CHANNEL_ID'))
-        intern_jobs = await self.get_jobs(hours_old=10)
-        await self.post_jobs(intern_jobs, channel_id)
+    async def full_time_job_task(self) -> None:
+        if not self.full_time_configured:
+            return
+        full_time_jobs = await self.get_jobs(search_term=SEARCH_QUERY, results_wanted=50, sites=SEARCH_SITES)
+        await self.post_jobs(full_time_jobs)
 
-    async def ng_2025_job_task(self):
-        channel_id = int(os.getenv('NG_2025_CHANNEL_ID'))
-        ng_2025_search_term = self.ng_2025_search_terms[self.ng_2025_search_index]
-
-        self.logger.info(
-            f"Running NG 2025 job task for channel ID: {channel_id} with search term '{ng_2025_search_term}'")
-        jobs = await self.get_jobs(search_term=ng_2025_search_term, hours_old=10)
-        self.logger.info(f"Found {len(jobs)} jobs for NG 2025 channel using '{ng_2025_search_term}'.")
-
-        await self.post_jobs(jobs, channel_id)
-        self.ng_2025_search_index = (self.ng_2025_search_index + 1) % len(self.ng_2025_search_terms)
-
-    async def ng_2024_job_task(self):
-        channel_id = int(os.getenv('NG_2024_CHANNEL_ID'))
-        current_search_term = self.ng_2024_search_terms[self.ng_2024_search_index]
-
-        self.logger.info(
-            f"Running NG 2024 job task for channel ID: {channel_id} with search term '{current_search_term}'")
-        jobs = await self.get_jobs(search_term=current_search_term, hours_old=10)
-        self.logger.info(f"Found {len(jobs)} jobs for NG 2024 channel using '{current_search_term}'.")
-
-        await self.post_jobs(jobs, channel_id)
-        self.ng_2024_search_index = (self.ng_2024_search_index + 1) % len(self.ng_2024_search_terms)
-
-    async def on_ready(self):
-        print('ready')
-        self.job_posting_task.start()
-
-    async def get_jobs(self, sites=None, search_term='software engineer intern', location='United States',
-                       results_wanted=15, hours_old=1):
+    async def get_jobs(
+        self,
+        sites: list[str] | dict[str, str] | None = None,
+        search_term: str = SEARCH_QUERY,
+        location: str = 'United States',
+        results_wanted: int = 15,
+        hours_old: int = 1,
+    ) -> pd.DataFrame:
         if sites is None:
-            sites = ['linkedin']
-        jobs = scrape_jobs(
-            site_name=sites,
-            search_term=search_term,
-            location=location,
-            results_wanted=results_wanted,
-            hours_old=hours_old,
-        )
-        return jobs
+            sites = SEARCH_SITES
 
-load_dotenv()
-bot = DiscordBot(s=session)
-bot.run(os.getenv("TOKEN"))
+        if isinstance(sites, list):
+            try:
+                return await asyncio.to_thread(
+                    scrape_jobs,
+                    site_name=sites,
+                    search_term=search_term,
+                    location=location,
+                    results_wanted=results_wanted,
+                    hours_old=hours_old,
+                    country_indeed="USA",
+                    linkedin_fetch_description=True,
+                )
+            except Exception:
+                self.logger.exception("Job scraping failed for sites=%s", sites)
+                return pd.DataFrame()
+
+        all_results = []
+        for site, term in sites.items():
+            try:
+                jobs = await asyncio.to_thread(
+                    scrape_jobs,
+                    site_name=site,
+                    search_term=term,
+                    location=location if site != "glassdoor" else None,
+                    results_wanted=results_wanted,
+                    hours_old=hours_old,
+                    country_indeed="USA",
+                    linkedin_fetch_description=True,
+                )
+            except Exception:
+                self.logger.exception("Job scraping failed for site=%s", site)
+                continue
+            if not jobs.empty:
+                all_results.append(jobs)
+
+        if not all_results:
+            return pd.DataFrame()
+
+        return pd.concat(all_results, ignore_index=True)
+
+    async def run(self) -> None:
+        self.logger.info("Python version: %s", platform.python_version())
+        self.logger.info("Running on: %s %s (%s)", platform.system(), platform.release(), os.name)
+        self.logger.info("-------------------")
+        while True:
+            try:
+                await self.full_time_job_task()
+                self.logger.info("Job posting task completed.")
+            except Exception:
+                self.logger.exception("job_posting_task failed; will retry next loop tick")
+            await asyncio.sleep(60)
+
+app = JobScraperApp(apobj=apobj)
+asyncio.run(app.run())
