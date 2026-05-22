@@ -6,3 +6,4 @@ jobs.db-journal
 .venv
 __pycache__/
 *.pyc
+Resume.pdf
