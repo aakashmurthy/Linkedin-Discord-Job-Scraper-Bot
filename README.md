@@ -67,7 +67,7 @@ Supported environment variables used by the current code:
 
 ## Current Architecture
 
-The project is currently a single-process Python app centered around [`bot.py`](/root/Linkedin-Discord-Job-Scraper-Bot-public/bot.py).
+The project is currently a single-process Python app centered around [`bot.py`](bot.py).
 
 Core components:
 
@@ -136,8 +136,8 @@ nohup python3 bot.py &
 
 ## Data Files
 
-- [`bot.py`](/root/Linkedin-Discord-Job-Scraper-Bot-public/bot.py): main application
-- [`requirements.txt`](/root/Linkedin-Discord-Job-Scraper-Bot-public/requirements.txt): Python dependencies
+- [`bot.py`](bot.py): main application
+- [`requirements.txt`](requirements.txt): Python dependencies
 - `Resume.pdf`: source resume used by the filtering prompt
 - `jobs.db`: SQLite database of already-seen jobs
 - `discord.log`: rotating runtime logs
