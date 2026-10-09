@@ -7,3 +7,17 @@ jobs.db-journal
 __pycache__/
 *.pyc
 Resume.pdf
+discord.log.*
+
+# Local credentials and private runtime artifacts
+.env.*
+!.env.example
+*.log
+*.log.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pdf
+*.pem
+*.key

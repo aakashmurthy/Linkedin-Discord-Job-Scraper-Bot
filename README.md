@@ -1,6 +1,6 @@
 # LinkedIn / Discord Job Scraper Bot
 
-This project continuously scrapes recent software-related job listings, filters them against the resume in `Resume.pdf` with an OpenAI-compatible model, and sends matching jobs to one or more notification targets through [Apprise](https://github.com/caronc/apprise).
+This project continuously scrapes recent job listings using AI-selected resume keywords, filters them against the resume in `Resume.pdf` with an OpenAI-compatible model, and sends matching jobs to one or more notification targets through [Apprise](https://github.com/caronc/apprise).
 
 Despite the repository name, the current implementation does not log in as a Discord bot. Discord delivery is handled through Apprise, typically with a Discord webhook URL.
 
@@ -8,19 +8,15 @@ Despite the repository name, the current implementation does not log in as a Dis
 
 - Python 3.11
 - A text-based `Resume.pdf` in the project root
-- An OpenAI-compatible API key in your environment
-  - [NVIDIA NIM](https://build.nvidia.com/explore/discover) is a free-tier option for an OpenAI-compatible provider.
+- An OpenAI API key in your environment (custom providers must support the Responses API and structured outputs)
 - At least one Apprise notification target if you want full-time job alerts
 
 ## What It Does
 
-- Scrapes recent jobs from LinkedIn, Indeed, and Glassdoor with `python-jobspy`
-- Searches for software, IT, data, ML, cloud, firmware, automation, and related roles
-- Rejects obvious mismatches before the LLM step:
-  - blacklisted companies
-  - senior/lead/manager-level titles
-  - titles that do not contain required keywords
-- Reads `Resume.pdf` and asks an OpenAI-compatible model whether a job is worth applying to
+- Scrapes recent jobs from LinkedIn, Indeed, Glassdoor, and ZipRecruiter with `python-jobspy`
+- Selects relevant search phrases and title keywords from the full resume once at startup
+- Skips blacklisted companies, then lets the LLM judge fit without title keyword vetoes
+- Sends only jobs rated good or excellent against the full resume
 - Sends accepted jobs through Apprise using the `ft` notification tag
 - Stores seen jobs in `jobs.db` so they are not posted repeatedly
 - Repeats the scrape loop every 60 seconds
@@ -28,12 +24,18 @@ Despite the repository name, the current implementation does not log in as a Dis
 ## Installation
 
 ```bash
-git clone https://github.com/haydenthai/Linkedin-Discord-Job-Scraper-Bot.git
+git clone https://github.com/YOUR_USERNAME/Linkedin-Discord-Job-Scraper-Bot.git
 cd Linkedin-Discord-Job-Scraper-Bot
-python3.11 -m venv .venv
+pyenv install -s 3.11.17
+pyenv local 3.11.17
+python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
+
+Install [pyenv](https://github.com/pyenv/pyenv#installation) and its Python build
+dependencies first, and enable pyenv in your shell. The project pins Python
+3.11.17 in `.python-version`; `.venv` isolates the bot's dependencies.
 
 ## Configuration
 
@@ -46,21 +48,24 @@ cp .env.example .env
 The example file currently includes:
 
 ```dotenv
-OPENAI_API_KEY=your_api_key
+# Only needed here if not already set globally:
+# OPENAI_API_KEY=your_api_key
 OPENAI_MODEL=gpt-5-nano-2025-08-07
-OPENAI_BASE_URL=
+OPENAI_REASONING_EFFORT=low
 FT_APPRISE_URLS=https://discord.com/api/webhooks/...
 ```
 
-At minimum, set `OPENAI_API_KEY`. Set `FT_APPRISE_URLS` if you want notifications enabled.
+At minimum, set `OPENAI_API_KEY` in your environment or `.env`. Existing environment variables take precedence over `.env`. Set `FT_APPRISE_URLS` if you want notifications enabled.
 
-If you want a low-cost OpenAI-compatible provider, [NVIDIA NIM](https://build.nvidia.com/explore/discover) is a reasonable option to try because it offers a free tier. In that case, keep `OPENAI_API_KEY` set to your NVIDIA key and point `OPENAI_BASE_URL` at the NIM-compatible endpoint you want to use.
+Custom providers must implement `/responses` with structured outputs. Chat Completions compatibility alone is insufficient.
 
 Supported environment variables used by the current code:
 
 - `OPENAI_API_KEY`: credential used by the OpenAI Python SDK
 - `OPENAI_MODEL`: optional model override; defaults to `gpt-5-nano-2025-08-07`
-- `OPENAI_BASE_URL`: optional custom OpenAI-compatible API base URL
+- `OPENAI_REASONING_EFFORT`: defaults to `low`; set to an empty string for models that do not support reasoning options
+- `OPENAI_PROMPT_CACHE_MODE`: `auto` (default), `explicit`, or `implicit`. Auto uses explicit caching for GPT-6 models on `api.openai.com`; other models and custom providers retain their default implicit behavior. Set `explicit` only when the configured model/provider supports explicit cache options and breakpoints.
+- `OPENAI_BASE_URL`: optional custom Responses-compatible API base URL
 - `OPENAI_API_BASE_URL`: alternate base URL variable name
 - `API_URL`: another fallback base URL variable name
 - `FT_APPRISE_URLS`: comma-separated Apprise URLs for full-time job notifications
@@ -73,7 +78,7 @@ Core components:
 
 - Job scraping: `jobspy.scrape_jobs(...)`
 - Resume parsing: `pypdf.PdfReader`
-- LLM filtering: `openai.AsyncOpenAI().responses.parse(...)`
+- AI keyword selection and LLM filtering: `openai.AsyncOpenAI().responses.parse(...)`
 - Notifications: `apprise.Apprise`
 - Persistence: SQLite via SQLAlchemy in `jobs.db`
 - Logging: console output plus rotating log files in `discord.log`
@@ -101,7 +106,7 @@ If `FT_APPRISE_URLS` is missing, the app still runs but skips the full-time noti
 
 ## Resume Requirements
 
-The application reads `Resume.pdf` at startup and exits immediately if:
+The application reads every page of `Resume.pdf` at startup and exits immediately if:
 
 - the file is missing
 - the PDF is unreadable
@@ -111,14 +116,26 @@ Use a normal text-based PDF, not an image-only scan.
 
 ## How Matching Works
 
-The LLM prompt is intentionally strict. It tries to reject jobs when:
+Before the first scrape, the AI selects up to eight search phrases based on demonstrated skills, experience, projects, education, and seniority. It also selects role/title terms for logging; these do not reject listings. Queries and title terms are cleaned, deduplicated, and logged. The company blacklist still applies.
 
-- required years of experience are above the candidate's qualifying corporate experience
-- the role is too senior
-- required hard skills are missing
-- clearance or citizenship requirements are missing
+The plan is reused for the process lifetime; restart after changing the resume. If analysis fails, is refused, or returns unusable terms, the bot uses `SEARCH_KEYWORDS` and `REQUIRED_TITLE_KEYWORDS` from `bot.py` for that run. No keyword request is made when notifications are disabled.
 
-If the LLM call fails because of rate limits, auth issues, or API errors, the app fails open and treats the job as postable while logging the reason.
+Both AI tasks use `AsyncOpenAI.responses.parse` with Pydantic schemas, `text_format`, and `output_parsed`, following the [official Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs). Responses are requested with `store=False`.
+
+With explicit caching, job evaluation places one breakpoint after the fixed audit instructions and full resume. Each job description follows that breakpoint, so changing job text is not written to the prompt cache. The one-off keyword request uses explicit mode without breakpoints, avoiding cache reads and writes for that task. Implicit mode omits these controls for compatibility with older models and custom providers.
+
+Cache keys are deterministic hashes of the task's stable prompt and structured-output schema, so restarting the bot does not change them. A cold or evicted cache can still write the reusable prefix; warm requests can read it when the provider's caching requirements are met. No job or resume content is truncated. See [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching).
+
+Both AI tasks log input, cached-read, cache-write, ordinary-input, and output tokens. Ordinary input is total input minus cached reads and cache writes. Missing read/write metrics are reported as `unavailable`, and ordinary input is unavailable if either is missing. Compare these logs across different jobs during normal operation to assess savings; mocked tests verify request structure rather than actual provider cache hits.
+
+The LLM rates each job as poor, fair, good, or excellent. Only good and excellent
+fits are sent. It considers relevant work (including freelance/self-employed work),
+projects, education, transferable skills, core responsibilities, and seniority.
+Missing exact keywords, preferred skills, or small experience gaps do not cause
+automatic rejection; material qualification gaps and insufficient job details do.
+
+Failed, refused, incomplete, or invalid evaluations send no notification and are
+not saved as rejections, allowing a later scrape to retry them.
 
 ## Running
 
@@ -128,11 +145,36 @@ Start the bot:
 python3 bot.py
 ```
 
-Run it in the background:
+Run it persistently with PM2 from the project directory. If your API key is
+exported in `.bashrc`, run these commands from a shell that has loaded it:
 
 ```bash
-nohup python3 bot.py &
+pm2 start ecosystem.config.cjs
+pm2 save
 ```
+
+The PM2 configuration uses `.venv/bin/python`, runs one instance, and restarts
+the bot after failures. Runtime logs are in `discord.log` and rotate automatically.
+The virtual environment uses the persistent Python installation managed by
+pyenv at `~/.pyenv/versions/3.11.17`. PM2 uses the virtual environment's absolute
+interpreter path, so it does not depend on shell initialization at boot.
+
+To restore the saved process list after reboot, run `pm2 startup` and follow
+its instructions, then run `pm2 save`.
+
+Useful management commands:
+
+```bash
+pm2 status
+pm2 restart linkedin-job-bot
+pm2 stop linkedin-job-bot
+tail -f discord.log
+```
+
+After changing an exported environment variable, restart from the shell that
+has loaded the new value with `pm2 restart linkedin-job-bot --update-env`, then
+run `pm2 save` again. Changes to `.env` are read on restart; existing exported
+variables still take precedence.
 
 ## Data Files
 
@@ -146,18 +188,36 @@ nohup python3 bot.py &
 
 The current search configuration in code is:
 
-- Sites: `linkedin`, `indeed`, `glassdoor`
-- Search query: `(computer science) OR software OR devops OR developer`
+- Sites: `linkedin`, `indeed`, `glassdoor`, `zip_recruiter`
+- Search query: resume-derived phrases joined with `OR`
+- Fallback query: `(computer science) OR software OR devops OR developer`
 - Location: `United States`
 - Freshness window: last 1 hour
 - Batch size: 50 jobs per loop for the full-time task
 
-The app also highlights Pacific Northwest jobs by tagging messages with `@everyone` when the location matches `WA`, `OR`, `Washington`, or `Oregon`.
+JobSpy is pinned to 1.3.0 for its updated Glassdoor endpoints and parsing.
+Descriptions are fetched for both LinkedIn and Glassdoor using `fetch_description=True`.
+Sites run concurrently with separate error handling, so a failed site does not discard
+jobs from the others. Location filters also apply to Glassdoor when using per-site queries.
+JobSpy warnings and errors are captured in `discord.log`, including under PM2.
+
+Before LLM evaluation, listings are deduplicated by job ID and normalized company,
+title, and location. The copy with the longest description is evaluated first.
+Successfully notified jobs and rejected jobs are remembered across runs; failed
+notifications can retry on the next run. Missing locations are not matched across
+sites. Older database entries without a saved location still match by job ID,
+but cannot match by company/title/location. This conservative match does not merge
+location aliases or differently worded titles; identical company/title/location
+listings are treated as one opening.
+
+The app tags accepted jobs with `@everyone` only for configured states (`WA`/`Washington` and `OR`/`Oregon`) or remote jobs. Remote status uses JobSpy metadata when available, otherwise the location text. Other accepted jobs are posted without a mention.
+
+## Tests
+
+Run `python3 -m unittest discover -s tests -v` after installing dependencies. Tests use a mocked HTTP transport with the real OpenAI SDK; they do not call OpenAI, scrape live sites, or send notifications.
 
 ## Known Gaps
 
-- The repository has no real automated test suite yet
-- `requirements.txt` is incomplete relative to `bot.py`
 - The implementation is a single large script with hardcoded search and filtering rules
 - Secrets should not be committed in `.env` or other tracked files
 
@@ -175,12 +235,14 @@ No jobs are being posted
 
 - Check that `FT_APPRISE_URLS` is set
 - Check `discord.log` for scrape failures or notification errors
-- Verify your OpenAI-compatible credentials are valid
+- Verify your OpenAI credentials are valid
 
 OpenAI request failures in logs
 
 - Confirm `OPENAI_API_KEY`
-- If using a non-OpenAI provider, set `OPENAI_BASE_URL`, `OPENAI_API_BASE_URL`, or `API_URL`
+- If using a custom provider, confirm it supports `/responses` and structured outputs before setting `OPENAI_BASE_URL`, `OPENAI_API_BASE_URL`, or `API_URL`
+- If the model does not accept reasoning options, set `OPENAI_REASONING_EFFORT=`
+- Upgrade dependencies with `pip install -r requirements.txt` if `responses.parse` is unavailable
 - Reduce request frequency or change models if you are hitting rate limits
 
 ## Security Note
