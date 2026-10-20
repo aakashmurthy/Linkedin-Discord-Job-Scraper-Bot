@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -80,6 +82,9 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
             "FT_APPRISE_URLS": "test", "OPENAI_MODEL": "gpt-5-nano-2025-08-07",
             "OPENAI_REASONING_EFFORT": "low",
             "OPENAI_PROMPT_CACHE_MODE": "auto",
+            "OPENAI_MAX_CONCURRENT_EVALUATIONS": "5",
+            "OPENAI_SEARCH_MODEL": "gpt-6.1-sol",
+            "OPENAI_SEARCH_REASONING_EFFORT": "medium",
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -87,6 +92,7 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
         self.reply = response_body({
             "keywords": [" technical writer ", "Technical Writer", "documentation specialist"],
             "title_keywords": ["writer", "documentation"],
+            "negative_keywords": ["registered nurse", "chief executive officer"],
         })
         self.http_status = 200
 
@@ -118,6 +124,81 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
             **changes,
         }
 
+    async def test_concurrent_evaluations_are_bounded_and_processed_as_completed(self):
+        self.app.max_concurrent_evaluations = 2
+        started = [asyncio.Event() for _ in range(4)]
+        release = [asyncio.Event() for _ in range(4)]
+        persisted = asyncio.Event()
+        active = peak = 0
+
+        async def evaluate(content, title, company):
+            nonlocal active, peak
+            index = int(title)
+            active += 1
+            peak = max(peak, active)
+            started[index].set()
+            try:
+                await release[index].wait()
+                if index == 3:
+                    raise RuntimeError("One failed request")
+                return False, "No match", ""
+            finally:
+                active -= 1
+
+        persist = self.app._persist_job
+
+        def record(*args):
+            persist(*args)
+            persisted.set()
+
+        self.app._call_llm = AsyncMock(side_effect=evaluate)
+        self.app._persist_job = Mock(side_effect=record)
+        rows = [self.duplicate_listing(str(i), title=str(i)) for i in range(4)]
+        # Deduplication must happen before starting concurrent requests.
+        task = asyncio.create_task(self.app.post_jobs(pd.DataFrame(rows + [rows[0]])))
+        try:
+            await asyncio.wait_for(started[0].wait(), 2)
+            await asyncio.wait_for(started[1].wait(), 2)
+            self.assertFalse(started[2].is_set())
+            release[1].set()
+            await asyncio.wait_for(started[2].wait(), 2)
+            await asyncio.wait_for(persisted.wait(), 2)
+            self.assertFalse(task.done())
+            self.assertFalse(release[0].is_set())
+            for event in release:
+                event.set()
+            await asyncio.wait_for(task, 2)
+            self.assertEqual(peak, 2)
+            self.assertEqual(self.app._call_llm.await_count, 4)
+            with self.app.session_factory() as session:
+                self.assertEqual(session.query(bot.FullTimeJob).count(), 3)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelling_batch_cleans_up_evaluations(self):
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def evaluate(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        self.app._call_llm = AsyncMock(side_effect=evaluate)
+        task = asyncio.create_task(self.app.post_jobs(pd.DataFrame([self.duplicate_listing("cancel")])))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            self.assertTrue(stopped.is_set())
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_cross_site_duplicates_use_fullest_description_before_llm(self):
         self.app._call_llm = AsyncMock(return_value=(False, "Not a match", ""))
         await self.app.post_jobs(pd.DataFrame([
@@ -128,6 +209,71 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
         ]))
         self.app._call_llm.assert_awaited_once()
         self.assertIn("A much more complete", self.app._call_llm.call_args.args[0])
+
+    async def test_search_plan_survives_database_reopen_without_api_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            url = f"sqlite:///{Path(directory) / 'jobs.db'}"
+            engine = create_engine(url)
+            try:
+                bot.Base.metadata.create_all(engine)
+                self.app.session_factory = sessionmaker(bind=engine)
+                await self.app.initialize_search()
+                self.assertEqual(len(self.requests), 1)
+                with self.app.session_factory() as session:
+                    cached = session.get(bot.CachedResumeSearchPlan,
+                                         hashlib.sha256(self.app.resume.encode()).hexdigest())
+                    self.assertIsNotNone(cached)
+                    self.assertEqual(json.loads(cached.plan_json)["keywords"],
+                                     ["technical writer", "documentation specialist"])
+            finally:
+                engine.dispose()
+
+            engine = create_engine(url)
+            try:
+                other = bot.JobScraperApp(Mock(), self.client, self.app.resume,
+                                          sessionmaker(bind=engine))
+                other.logger = Mock()
+                other._parse_response = AsyncMock(side_effect=AssertionError("Cache should avoid API"))
+                await other.initialize_search()
+                other._parse_response.assert_not_awaited()
+                self.assertEqual(other.search_query, self.app.search_query)
+                self.assertEqual(other.required_title_keywords, self.app.required_title_keywords)
+                self.assertEqual(other.negative_keywords, self.app.negative_keywords)
+            finally:
+                engine.dispose()
+
+    async def test_changed_resume_generates_separate_plan(self):
+        await self.app.initialize_search()
+        other = bot.JobScraperApp(Mock(), self.client, self.app.resume + "\nNew skills",
+                                  self.app.session_factory)
+        other.logger = Mock()
+        await other.initialize_search()
+        self.assertEqual(len(self.requests), 2)
+        with self.app.session_factory() as session:
+            self.assertEqual(session.query(bot.CachedResumeSearchPlan).count(), 2)
+
+    async def test_invalid_cached_search_plan_is_regenerated(self):
+        resume_hash = hashlib.sha256(self.app.resume.encode()).hexdigest()
+        for value in ("invalid json", json.dumps({"keywords": ["***"],
+                      "title_keywords": ["writer"], "negative_keywords": []})):
+            with self.subTest(value=value):
+                with self.app.session_factory() as session:
+                    session.merge(bot.CachedResumeSearchPlan(resume_hash=resume_hash, plan_json=value))
+                    session.commit()
+                self.app._search_initialized = False
+                count = len(self.requests)
+                await self.app.initialize_search()
+                self.assertEqual(len(self.requests), count + 1)
+                with self.app.session_factory() as session:
+                    cached = session.get(bot.CachedResumeSearchPlan, resume_hash)
+                    self.assertEqual(json.loads(cached.plan_json)["keywords"][0], "technical writer")
+
+    async def test_cache_database_failure_keeps_generated_plan(self):
+        self.app.session_factory = Mock(side_effect=RuntimeError("Database unavailable"))
+        await self.app.initialize_search()
+        self.assertEqual(self.app.search_query, "(technical writer) OR (documentation specialist)")
+        self.assertTrue(self.app.negative_keywords)
+        self.assertEqual(len(self.requests), 1)
 
     async def test_cross_site_dedup_survives_new_app_instance(self):
         self.app._call_llm = AsyncMock(return_value=(False, "Not a match", ""))
@@ -211,15 +357,16 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests[0].url.path, "/v1/responses")
         request = json.loads(self.requests[0].content)
         self.assertEqual(request["input"][1]["content"], self.app.resume)
-        self.assertEqual(request["model"], "gpt-5-nano-2025-08-07")
-        self.assertEqual(request["reasoning"], {"effort": "low"})
-        self.assertFalse(request["store"])
+        self.assertEqual(request["model"], "gpt-6.1-sol")
+        self.assertEqual(request["service_tier"], "default")
+        self.assertEqual(request["reasoning"], {"effort": "medium"})
+        self.assertTrue(request["store"])
         self.assertNotIn("response_format", request)
         fmt = request["text"]["format"]
         self.assertEqual(fmt["type"], "json_schema")
         self.assertTrue(fmt["strict"])
         self.assertFalse(fmt["schema"]["additionalProperties"])
-        self.assertEqual(set(fmt["schema"]["required"]), {"keywords", "title_keywords"})
+        self.assertEqual(set(fmt["schema"]["required"]), {"keywords", "title_keywords", "negative_keywords"})
         for call in scrape.call_args_list:
             self.assertEqual(call.kwargs["search_term"], "(technical writer) OR (documentation specialist)")
         self.assertIn("writer", self.app.required_title_keywords)
@@ -241,11 +388,11 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_or_unusable_plans_keep_defaults_without_repeated_calls(self):
         cases = [
             (200, response_body(refusal=True)),
-            (200, response_body({"keywords": [], "title_keywords": ["writer"]})),
-            (200, response_body({"keywords": ["***"], "title_keywords": ["writer"]})),
-            (200, response_body({"keywords": ["writer"], "title_keywords": []})),
-            (200, response_body({"keywords": "not an array", "title_keywords": []})),
-            (200, response_body({"keywords": ["writer"], "title_keywords": ["writer"]}, status="incomplete")),
+            (200, response_body({"keywords": [], "title_keywords": ["writer"], "negative_keywords": []})),
+            (200, response_body({"keywords": ["***"], "title_keywords": ["writer"], "negative_keywords": []})),
+            (200, response_body({"keywords": ["writer"], "title_keywords": [], "negative_keywords": []})),
+            (200, response_body({"keywords": "not an array", "title_keywords": [], "negative_keywords": []})),
+            (200, response_body({"keywords": ["writer"], "title_keywords": ["writer"], "negative_keywords": []}, status="incomplete")),
             (429, {"error": {"message": "Too many requests", "type": "rate_limit_error"}}),
             (401, {"error": {"message": "Unauthorized", "type": "authentication_error"}}),
         ]
@@ -259,6 +406,9 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.requests), count + 1)
                 self.assertEqual(self.app.search_query, bot.SEARCH_QUERY)
                 self.assertEqual(self.app.required_title_keywords, bot.REQUIRED_TITLE_KEYWORDS)
+                self.assertEqual(self.app.negative_keywords, [])
+                with self.app.session_factory() as session:
+                    self.assertEqual(session.query(bot.CachedResumeSearchPlan).count(), 0)
 
     async def test_evaluation_parses_decision_and_usage(self):
         self.reply = response_body({"fit": "poor", "reason": "Missing required skill"})
@@ -269,6 +419,7 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
         request = json.loads(self.requests[0].content)
         self.assertIn(self.app.resume, request["input"][0]["content"])
         self.assertEqual(request["text"]["format"]["name"], "ApplicationAnalyzer")
+        self.assertEqual(request["service_tier"], "flex")
 
     async def test_evaluation_refusal_defers_notification(self):
         self.reply = response_body(refusal=True)
@@ -339,9 +490,40 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.startswith(bot.PING_MENTION), ping)
 
     async def test_reasoning_can_be_omitted_for_other_models(self):
-        with patch.dict(os.environ, {"OPENAI_REASONING_EFFORT": ""}):
+        with patch.dict(os.environ, {"OPENAI_SEARCH_REASONING_EFFORT": ""}):
             await self.app.initialize_search()
         self.assertNotIn("reasoning", json.loads(self.requests[0].content))
+
+    async def test_negative_keywords_skip_titles_before_individual_evaluation(self):
+        await self.app.initialize_search()
+        self.app._call_llm = AsyncMock(return_value=(False, "No match", ""))
+        await self.app.post_jobs(pd.DataFrame([
+            self.duplicate_listing("excluded", title="REGISTERED-NURSE (RN)"),
+            self.duplicate_listing("allowed", title="Software Engineer",
+                                   description="Build tools for registered nurses."),
+            self.duplicate_listing("boundary", title="Registered Nursery Engineer"),
+        ]))
+        self.assertEqual(self.app._call_llm.await_count, 2)
+        reviewed = {call.args[1] for call in self.app._call_llm.call_args_list}
+        self.assertEqual(reviewed, {"Software Engineer", "Registered Nursery Engineer"})
+        with self.app.session_factory() as session:
+            self.assertEqual(session.query(bot.FullTimeJob).count(), 2)
+
+    async def test_planner_overrides_and_empty_negative_keywords(self):
+        self.reply = response_body({"keywords": ["writer"], "title_keywords": ["writer"],
+                                    "negative_keywords": []})
+        with patch.dict(os.environ, {"OPENAI_SEARCH_MODEL": "custom-planner",
+                                    "OPENAI_SEARCH_REASONING_EFFORT": "high"}):
+            await self.app.initialize_search()
+        request = json.loads(self.requests[0].content)
+        self.assertEqual(request["model"], "custom-planner")
+        self.assertEqual(request["reasoning"], {"effort": "high"})
+        self.assertEqual(self.app.negative_keywords, [])
+        self.reply = response_body({"fit": "poor", "reason": "No match"})
+        await self.app._call_llm("Job", "Writer", "Example")
+        evaluation = json.loads(self.requests[1].content)
+        self.assertEqual(evaluation["model"], "gpt-5-nano-2025-08-07")
+        self.assertEqual(evaluation["reasoning"], {"effort": "low"})
 
     async def test_no_keyword_call_when_notifications_disabled(self):
         self.app.full_time_configured = False
@@ -364,7 +546,7 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["input"][1], {"role": "user", "content": "First distinct job"})
         self.assertEqual(second["input"][1]["content"], "Second distinct job")
         self.assertEqual(first["prompt_cache_key"], second["prompt_cache_key"])
-        self.assertFalse(first["store"])
+        self.assertTrue(first["store"])
         self.assertEqual(first["text"]["format"]["name"], "ApplicationAnalyzer")
 
     async def test_explicit_keyword_request_has_no_cache_breakpoints(self):

@@ -14,8 +14,8 @@ Despite the repository name, the current implementation does not log in as a Dis
 ## What It Does
 
 - Scrapes recent jobs from LinkedIn, Indeed, Glassdoor, and ZipRecruiter with `python-jobspy`
-- Selects relevant search phrases and title keywords from the full resume once at startup
-- Skips blacklisted companies, then lets the LLM judge fit without title keyword vetoes
+- Selects search phrases, title terms, and negative title keywords from the full resume once at startup
+- Skips blacklisted companies and titles matching negative keywords, then lets the LLM judge fit
 - Sends only jobs rated good or excellent against the full resume
 - Sends accepted jobs through Apprise using the `ft` notification tag
 - Stores seen jobs in `jobs.db` so they are not posted repeatedly
@@ -62,8 +62,11 @@ Custom providers must implement `/responses` with structured outputs. Chat Compl
 Supported environment variables used by the current code:
 
 - `OPENAI_API_KEY`: credential used by the OpenAI Python SDK
-- `OPENAI_MODEL`: optional model override; defaults to `gpt-5-nano-2025-08-07`
+- `OPENAI_MODEL`: job evaluation model; defaults to `gpt-5-nano-2025-08-07`
+- `OPENAI_SEARCH_MODEL`: model for generating search terms and negative keywords; defaults to `gpt-6.1-sol`
+- `OPENAI_SEARCH_REASONING_EFFORT`: reasoning effort for search planning; defaults to `medium`. Set to an empty string for planners without reasoning support.
 - `OPENAI_REASONING_EFFORT`: defaults to `low`; set to an empty string for models that do not support reasoning options
+- `OPENAI_MAX_CONCURRENT_EVALUATIONS`: positive integer, defaults to `5`. Limits simultaneous job evaluation requests. Completed evaluations are handled immediately, while notifications and database writes run sequentially. Each scrape waits for its evaluations before the next loop.
 - `OPENAI_PROMPT_CACHE_MODE`: `auto` (default), `explicit`, or `implicit`. Auto uses explicit caching for GPT-6 models on `api.openai.com`; other models and custom providers retain their default implicit behavior. Set `explicit` only when the configured model/provider supports explicit cache options and breakpoints.
 - `OPENAI_BASE_URL`: optional custom Responses-compatible API base URL
 - `OPENAI_API_BASE_URL`: alternate base URL variable name
@@ -116,11 +119,15 @@ Use a normal text-based PDF, not an image-only scan.
 
 ## How Matching Works
 
-Before the first scrape, the AI selects up to eight search phrases based on demonstrated skills, experience, projects, education, and seniority. It also selects role/title terms for logging; these do not reject listings. Queries and title terms are cleaned, deduplicated, and logged. The company blacklist still applies.
+Before the first scrape, the AI selects up to eight search phrases based on demonstrated skills, experience, projects, education, and seniority. It also selects role/title terms for logging and up to twenty negative title phrases for clearly unsuitable roles. Search planning defaults to `gpt-6.1-sol` with medium reasoning effort using standard processing. Queries and title terms are cleaned, deduplicated, and logged.
 
-The plan is reused for the process lifetime; restart after changing the resume. If analysis fails, is refused, or returns unusable terms, the bot uses `SEARCH_KEYWORDS` and `REQUIRED_TITLE_KEYWORDS` from `bot.py` for that run. No keyword request is made when notifications are disabled.
+Negative keywords filter scraped job titles locally before paid individual evaluation. Matching ignores case, uses whole phrases, and treats spaces and punctuation between words equivalently. Descriptions are not checked for negative keywords, so mentioning an unrelated role in the description does not exclude a job. The planner is instructed to avoid broad exclusions that would hide transferable roles. Skipped jobs are logged and are not permanently saved as rejected, allowing a later plan to reconsider them. Positive title terms do not reject listings. The company blacklist still applies.
 
-Both AI tasks use `AsyncOpenAI.responses.parse` with Pydantic schemas, `text_format`, and `output_parsed`, following the [official Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs). Responses are requested with `store=False`.
+Search plans are saved in the `resume_search_plans` table in `jobs.db`, keyed by the SHA-256 hash of the full extracted resume text. On startup, an identical resume reuses its saved positive search keywords, title terms, and negative keywords without calling the planner. Changed resume text generates and saves a separate plan; replacing the PDF without changing its extracted text reuses the existing plan. Model or prompt changes alone do not invalidate a saved plan. Delete its row from `resume_search_plans` to force regeneration.
+
+Restart after changing the resume. Invalid cached plans are regenerated. Cache database failures do not prevent using a newly generated plan. If analysis fails, is refused, or returns unusable terms, the bot uses `SEARCH_KEYWORDS` and `REQUIRED_TITLE_KEYWORDS` from `bot.py` with no negative keywords for that run; this fallback is not cached. No keyword request is made when notifications are disabled.
+
+Both AI tasks use `AsyncOpenAI.responses.parse` with Pydantic schemas, `text_format`, and `output_parsed`, following the [official Structured Outputs guide](https://developers.openai.com/api/docs/guides/structured-outputs). Search planning requests standard processing with `service_tier="default"`. Individual job evaluations request `service_tier="flex"` for lower-cost processing with potentially slower responses and occasional capacity errors; the configured evaluation model/provider must support [Flex processing](https://developers.openai.com/api/docs/guides/flex-processing). Responses are requested with `store=True` so future requests, including resume and job content, can appear in the OpenAI dashboard logs, subject to the organization's retention policy.
 
 With explicit caching, job evaluation places one breakpoint after the fixed audit instructions and full resume. Each job description follows that breakpoint, so changing job text is not written to the prompt cache. The one-off keyword request uses explicit mode without breakpoints, avoiding cache reads and writes for that task. Implicit mode omits these controls for compatibility with older models and custom providers.
 
