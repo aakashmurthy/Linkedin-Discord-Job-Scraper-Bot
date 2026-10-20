@@ -509,6 +509,20 @@ class ScraperTests(unittest.IsolatedAsyncioTestCase):
         with self.app.session_factory() as session:
             self.assertEqual(session.query(bot.FullTimeJob).count(), 2)
 
+    async def test_broad_negative_terms_match_title_variants_and_abbreviations(self):
+        self.app.negative_keywords = ["senior", "sr", "staff", "principal", "manager", "director", "chief", "cto"]
+        self.app._call_llm = AsyncMock(return_value=(False, "No match", ""))
+        excluded = ["Senior Backend Engineer", "Sr. Data Engineer", "Staff AI Developer",
+                    "Principal API Engineer", "Software Development Manager",
+                    "Director of Data", "Chief Technology Officer", "CTO"]
+        allowed = ["Staffing Platform Developer", "Management Software Developer", "Junior Backend Engineer"]
+        rows = [self.duplicate_listing(str(i), title=title,
+                                       description="Collaborate with senior staff and managers.")
+                for i, title in enumerate(excluded + allowed)]
+        await self.app.post_jobs(pd.DataFrame(rows))
+        reviewed = {call.args[1] for call in self.app._call_llm.call_args_list}
+        self.assertEqual(reviewed, set(allowed))
+
     async def test_planner_overrides_and_empty_negative_keywords(self):
         self.reply = response_body({"keywords": ["writer"], "title_keywords": ["writer"],
                                     "negative_keywords": []})
